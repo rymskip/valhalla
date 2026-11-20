@@ -21,6 +21,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -334,6 +335,12 @@ public:
                     const std::string& state_name,
                     const std::string& country_iso,
                     const std::string& state_iso);
+
+  /**
+   * Whether the tile file at `path` is whole: its header names `id`, its size matches the header,
+   * and its data hashes to the checksum the header carries.
+   */
+  static bool IsComplete(const std::filesystem::path& path, const baldr::GraphId& id);
 
   /**
    * Gets a reference to the header builder.

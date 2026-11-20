@@ -8,12 +8,14 @@
 #include "mjolnir/util.h"
 
 #include <openssl/evp.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -94,17 +96,34 @@ private:
   std::streamsize pos_ = 0;
 };
 
+// A temp name for a tile that no other thread or process writing the same tile can pick.
+std::filesystem::path temp_path_for(const std::filesystem::path& file_path) {
+  static const std::string process_token = [] {
+    std::random_device entropy;
+    std::ostringstream token;
+    token << ::getpid() << "_" << std::hex
+          << ((static_cast<uint64_t>(entropy()) << 32) | entropy());
+    return token.str();
+  }();
+  std::ostringstream suffix;
+  suffix << "_" << process_token << "_" << std::this_thread::get_id() << ".tmp";
+  std::filesystem::path temp = file_path;
+  temp += suffix.str();
+  return temp;
+}
+
 // Tile streamer: data portion is streamed to disk and hashed incrementally instead of being
 // buffered whole. A placeholder header is written first; finalize() re-stamps later with the final
 // checksum of the tile data portion.
 class tile_ostream : public std::ostream {
 public:
   tile_ostream(const std::filesystem::path& file_path, GraphTileHeader& header)
-      : std::ostream(nullptr), header_(header),
-        file_(file_path, std::ios::out | std::ios::binary | std::ios::trunc),
+      : std::ostream(nullptr), header_(header), final_path_(file_path),
+        temp_path_(temp_path_for(file_path)),
+        file_(temp_path_, std::ios::out | std::ios::binary | std::ios::trunc),
         md5_ctx_(EVP_MD_CTX_new(), &EVP_MD_CTX_free), buf_(file_, md5_ctx_.get()) {
     if (!file_.is_open())
-      throw std::runtime_error("Failed to open file " + file_path.string());
+      throw std::runtime_error("Failed to open file " + temp_path_.string());
     if (!md5_ctx_ || EVP_DigestInit_ex(md5_ctx_.get(), EVP_md5(), nullptr) != 1)
       throw std::runtime_error("EVP_DigestInit failed");
     rdbuf(&buf_);
@@ -128,10 +147,17 @@ public:
     file_.seekp(0);
     file_.write(reinterpret_cast<const char*>(&header_), sizeof(GraphTileHeader));
     file_.close();
+    if (file_.fail()) {
+      throw std::runtime_error("Failed to write " + temp_path_.string());
+    }
+    // Readers may load a tile while it is rewritten: they see the old file or the new one.
+    std::filesystem::rename(temp_path_, final_path_);
   }
 
 private:
   GraphTileHeader& header_;
+  std::filesystem::path final_path_;
+  std::filesystem::path temp_path_;
   std::ofstream file_;
   std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md5_ctx_;
   hashing_streambuf buf_;
@@ -360,17 +386,8 @@ void GraphTileBuilder::StoreTileData() {
     std::filesystem::create_directories(filename.parent_path());
   }
 
-  // Tiles are rewritten multiple times during building. Since threads may read tiles while they're
-  // being written, we use atomic "write to temp file + rename" to avoid partial reads.
-  std::filesystem::path tmp_filename = filename;
-  {
-    std::ostringstream suffix;
-    suffix << "_" << std::this_thread::get_id() << ".tmp";
-    tmp_filename += suffix.str();
-  }
-
-  // Stream the tile body straight to the temp file, hashing as we go.
-  tile_ostream in_mem(tmp_filename, header_builder_);
+  // Stream the tile body straight to a temp file, hashing as we go.
+  tile_ostream in_mem(filename, header_builder_);
   // Write the nodes
   header_builder_.set_nodecount(nodes_builder_.size());
   in_mem.write(reinterpret_cast<const char*>(nodes_builder_.data()),
@@ -522,9 +539,49 @@ void GraphTileBuilder::StoreTileData() {
   LOG_DEBUG("   admins = {}  departures = {} stops = {} routes = {}", admins_builder_.size(),
             departure_builder_.size(), stop_builder_.size(), route_builder_.size());
 
-  // Stamp the data hash into the header and rewrite it in place, then publish atomically.
+  // Stamp the data hash into the header and publish the tile.
   in_mem.finalize();
-  std::filesystem::rename(tmp_filename, filename);
+}
+
+bool GraphTileBuilder::IsComplete(const std::filesystem::path& path, const GraphId& id) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file) {
+    return false;
+  }
+  const auto size = static_cast<uint64_t>(file.tellg());
+  if (size < sizeof(GraphTileHeader)) {
+    return false;
+  }
+  file.seekg(0);
+  GraphTileHeader header;
+  if (!file.read(reinterpret_cast<char*>(&header), sizeof(GraphTileHeader)) ||
+      header.graphid() != id || header.end_offset() != size) {
+    return false;
+  }
+
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md5_ctx(EVP_MD_CTX_new(),
+                                                                  &EVP_MD_CTX_free);
+  if (!md5_ctx || EVP_DigestInit_ex(md5_ctx.get(), EVP_md5(), nullptr) != 1) {
+    throw std::runtime_error("EVP_DigestInit failed");
+  }
+  std::vector<char> chunk(1 << 20);
+  while (file) {
+    file.read(chunk.data(), chunk.size());
+    const auto got = file.gcount();
+    if (got > 0 && EVP_DigestUpdate(md5_ctx.get(), chunk.data(), got) != 1) {
+      throw std::runtime_error("EVP_DigestUpdate failed");
+    }
+  }
+  if (!file.eof()) {
+    return false;
+  }
+  std::array<unsigned char, 16> digest{};
+  unsigned int out_len = 0;
+  if (EVP_DigestFinal_ex(md5_ctx.get(), digest.data(), &out_len) != 1 || out_len != digest.size()) {
+    throw std::runtime_error("EVP_DigestFinal failed");
+  }
+  constexpr uint64_t tile_hash_mask = (uint64_t(1) << baldr::kTileHashBits) - 1;
+  return (fold_md5(digest) & tile_hash_mask) == header.tile_checksum();
 }
 
 // Update a graph tile with new nodes and directed edges. The rest of the

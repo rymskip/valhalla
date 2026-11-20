@@ -23,6 +23,8 @@
 #include <ankerl/unordered_dense.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <limits>
@@ -1383,6 +1385,7 @@ void enhance(const boost::property_tree::ptree& mjolnir_config,
 
     // Write the new file
     tilebuilder->StoreTileData();
+    append_to_tile_journal(reader.tile_dir(), resume_files::kEnhancedTiles, tile_id);
     LOG_TRACE("GraphEnhancer completed tile " + std::to_string(tile_id));
 
     // Check if we need to clear the tile cache
@@ -1421,8 +1424,31 @@ void GraphEnhancer::Enhance(const boost::property_tree::ptree& pt,
   auto local_level = TileHierarchy::levels().back().level;
   GraphReader reader(mjolnir_config);
   auto local_tiles = reader.GetTileSet(local_level);
+
+  // Enhance converts some values in place, so on resume a tile it already rewrote is skipped.
+  const std::filesystem::path tile_root{reader.tile_dir()};
+  const std::filesystem::path journal = tile_root / resume_files::kEnhancedTiles;
+  const bool resume = std::getenv("VALHALLA_RESUME_TILES") != nullptr;
+  std::unordered_set<uint64_t> enhanced;
+  if (resume) {
+    remove_stale_temp_tiles(tile_root);
+    enhanced = read_tile_journal(journal);
+  } else {
+    std::filesystem::remove(journal);
+  }
   for (const auto& tile_id : local_tiles) {
+    if (enhanced.count(tile_id.value) != 0) {
+      const std::filesystem::path path = tile_root / GraphTile::FileSuffix(tile_id);
+      if (!GraphTileBuilder::IsComplete(path, tile_id)) {
+        throw std::runtime_error("Enhanced tile failed verification: " + path.string());
+      }
+      continue;
+    }
     tempqueue.emplace_back(tile_id);
+  }
+  if (resume) {
+    LOG_INFO("Resuming: " + std::to_string(local_tiles.size() - tempqueue.size()) +
+             " enhanced tiles verified, " + std::to_string(tempqueue.size()) + " to enhance");
   }
   std::random_device rd;
   std::shuffle(tempqueue.begin(), tempqueue.end(), std::mt19937(rd()));

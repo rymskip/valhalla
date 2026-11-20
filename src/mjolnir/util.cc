@@ -24,8 +24,18 @@
 #include <boost/property_tree/ptree.hpp>
 #include <cpp-statsd-client/StatsdClient.hpp>
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <charconv>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <mutex>
+#include <system_error>
+#include <unordered_set>
 
 using boost::property_tree::ptree;
 using namespace valhalla::baldr;
@@ -638,6 +648,128 @@ void ProcessEdgeTransitions(const uint32_t idx,
   }
 }
 
+void sync_to_disk(const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    throw std::system_error(errno, std::generic_category(), "open " + path.string() + " to sync");
+  }
+  const int synced = ::fsync(fd);
+  const int sync_errno = errno;
+  ::close(fd);
+  if (synced != 0) {
+    throw std::system_error(sync_errno, std::generic_category(), "fsync " + path.string());
+  }
+}
+
+void write_marker(const std::filesystem::path& path) {
+  {
+    std::ofstream marker(path, std::ios::binary | std::ios::trunc);
+    if (!marker) {
+      throw std::runtime_error("Failed to create " + path.string());
+    }
+  }
+  sync_to_disk(path);
+  sync_to_disk(path.parent_path());
+}
+
+void append_to_tile_journal(const std::filesystem::path& tile_dir,
+                            const char* journal_name,
+                            const baldr::GraphId& tile_id) {
+  static std::mutex journal_mutex;
+  const std::filesystem::path tile = tile_dir / GraphTile::FileSuffix(tile_id);
+  sync_to_disk(tile);
+  sync_to_disk(tile.parent_path());
+
+  const std::filesystem::path journal = tile_dir / journal_name;
+  const std::string line = std::to_string(tile_id.value) + "\n";
+  std::lock_guard<std::mutex> guard(journal_mutex);
+  const int fd = ::open(journal.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd < 0) {
+    throw std::system_error(errno, std::generic_category(), "open " + journal.string());
+  }
+  const ssize_t written = ::write(fd, line.data(), line.size());
+  const int write_errno = errno;
+  const bool whole = written == static_cast<ssize_t>(line.size());
+  const int synced = whole ? ::fsync(fd) : -1;
+  const int sync_errno = errno;
+  ::close(fd);
+  if (!whole) {
+    throw std::system_error(write_errno, std::generic_category(), "append to " + journal.string());
+  }
+  if (synced != 0) {
+    throw std::system_error(sync_errno, std::generic_category(), "fsync " + journal.string());
+  }
+}
+
+std::unordered_set<uint64_t> read_tile_journal(const std::filesystem::path& journal) {
+  std::unordered_set<uint64_t> tiles;
+  if (!std::filesystem::exists(journal)) {
+    return tiles;
+  }
+  std::ifstream file(journal);
+  if (!file) {
+    throw std::runtime_error("Failed to open " + journal.string());
+  }
+  std::string line;
+  while (std::getline(file, line)) {
+    uint64_t value = 0;
+    const auto [end, error] = std::from_chars(line.data(), line.data() + line.size(), value);
+    if (error != std::errc() || end != line.data() + line.size()) {
+      LOG_WARN("Ignoring torn line '" + line + "' in " + journal.string());
+      continue;
+    }
+    tiles.insert(value);
+  }
+  if (file.bad()) {
+    throw std::runtime_error("Failed to read " + journal.string());
+  }
+  return tiles;
+}
+
+void remove_stale_temp_tiles(const std::filesystem::path& tile_dir) {
+  std::vector<std::filesystem::path> stale;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(tile_dir)) {
+    const auto name = entry.path().filename().string();
+    if (entry.is_regular_file() && name.ends_with(".tmp") &&
+        name.find(".gph_") != std::string::npos) {
+      stale.push_back(entry.path());
+    }
+  }
+  for (const auto& path : stale) {
+    std::filesystem::remove(path);
+  }
+  if (!stale.empty()) {
+    LOG_INFO("Removed " + std::to_string(stale.size()) + " temp tiles left by an interrupted run");
+  }
+}
+
+namespace {
+
+// One build per tile directory: a second writer would interleave its tiles with this one's.
+class TileDirLock {
+public:
+  explicit TileDirLock(const std::filesystem::path& path)
+      : fd_(::open(path.c_str(), O_CREAT | O_RDWR, 0644)) {
+    if (fd_ < 0) {
+      throw std::system_error(errno, std::generic_category(), "open " + path.string());
+    }
+    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+      ::close(fd_);
+      throw std::runtime_error("Another tile build holds " + path.string());
+    }
+  }
+  ~TileDirLock() {
+    ::close(fd_);
+  }
+  TileDirLock(const TileDirLock&) = delete;
+  TileDirLock& operator=(const TileDirLock&) = delete;
+
+private:
+  int fd_;
+};
+
+} // namespace
+
 bool build_tile_set(const boost::property_tree::ptree& original_config,
                     const std::vector<std::string>& input_files,
                     const BuildStage start_stage,
@@ -689,6 +821,8 @@ bool build_tile_set(const boost::property_tree::ptree& original_config,
     // Create the directory if it does not exist
     std::filesystem::create_directories(tile_dir);
   }
+
+  const TileDirLock tile_dir_lock(std::filesystem::path(tile_dir) / resume_files::kLock);
 
   // Snapshot for per-stage delta reporting
   auto log_stage = [&config](BuildStage stage) { build_stats::get().log_stage(stage, config); };
@@ -772,6 +906,13 @@ bool build_tile_set(const boost::property_tree::ptree& original_config,
     log_stage(BuildStage::kParseNodes);
   }
 
+  // A run that starts after the parse stages has only the parsed data written to temp files
+  if (start_stage > BuildStage::kParseNodes && start_stage <= BuildStage::kBuild) {
+    if (!osm_data.read_from_temp_files(tile_dir)) {
+      throw std::runtime_error("Failed to read the parsed OSM data from " + tile_dir);
+    }
+  }
+
   // Builds pedestrian areas
   if (start_stage <= BuildStage::kBuildAreas && BuildStage::kBuildAreas <= end_stage) {
     if (config.get<bool>("mjolnir.pedestrian_areas", false) &&
@@ -789,11 +930,6 @@ bool build_tile_set(const boost::property_tree::ptree& original_config,
   // Construct edges
   std::map<baldr::GraphId, size_t> tiles;
   if (start_stage <= BuildStage::kConstructEdges && BuildStage::kConstructEdges <= end_stage) {
-
-    // Read OSMData from files if construct edges is the first stage
-    if (start_stage == BuildStage::kConstructEdges)
-      osm_data.read_from_temp_files(tile_dir);
-
     tiles = GraphBuilder::BuildEdges(config, ways_bin, way_nodes_bin, nodes_bin, edges_bin);
     // Output manifest
     TileManifest manifest{tiles};
@@ -804,8 +940,6 @@ bool build_tile_set(const boost::property_tree::ptree& original_config,
   // Build Valhalla routing tiles
   if (start_stage <= BuildStage::kBuild && BuildStage::kBuild <= end_stage) {
     if (start_stage == BuildStage::kBuild) {
-      // Read OSMData from files if building tiles is the first stage
-      osm_data.read_from_temp_files(tile_dir);
       if (std::filesystem::exists(tile_manifest)) {
         tiles = TileManifest::ReadFromFile(tile_manifest).tileset;
       } else {
@@ -831,6 +965,9 @@ bool build_tile_set(const boost::property_tree::ptree& original_config,
     if (start_stage == BuildStage::kEnhance) {
       osm_data.read_from_unique_names_file(tile_dir);
     }
+    // From here on tiles are rewritten in place of the build stage's, so the build stage can no
+    // longer be resumed.
+    write_marker(std::filesystem::path(tile_dir) / resume_files::kEnhanceStarted);
     GraphEnhancer::Enhance(config, osm_data, access_bin);
     log_stage(BuildStage::kEnhance);
   }

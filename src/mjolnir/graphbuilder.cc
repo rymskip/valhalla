@@ -3,6 +3,7 @@
 #include "baldr/datetime.h"
 #include "baldr/graphconstants.h"
 #include "baldr/graphid.h"
+#include "baldr/graphtile.h"
 #include "baldr/signinfo.h"
 #include "baldr/tilehierarchy.h"
 #include "midgard/logging.h"
@@ -24,11 +25,14 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/property_tree/ptree.hpp>
 
+#include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 using namespace valhalla::midgard;
@@ -619,6 +623,9 @@ void BuildTileSet(const std::string& ways_file,
 
     auto tile = tiles.front();
     tiles.pop();
+    if (tiles.size() % 1000 == 0) {
+      LOG_INFO(std::to_string(tiles.size()) + " tiles left to build");
+    }
     tiles_lock.unlock();
 
     try {
@@ -1416,6 +1423,7 @@ void BuildTileSet(const std::string& ways_file,
 
       // Write the actual tile to disk
       graphtile.StoreTileData();
+      append_to_tile_journal(tile_dir, resume_files::kBuiltTiles, tile_id);
 
       // Made a tile
       LOG_DEBUG("Wrote tile {}: {} bytes", tile.first, graphtile.header_builder().end_offset());
@@ -1449,6 +1457,48 @@ void BuildLocalTiles(const unsigned int thread_count,
                      DataQuality& stats,
                      const boost::property_tree::ptree& pt) {
   SCOPED_TIMER();
+
+  // Divvy up the work. On resume, a tile is skipped only when the journal names it and its
+  // contents still match the checksum in its header.
+  const bool resume = std::getenv("VALHALLA_RESUME_TILES") != nullptr;
+  const std::filesystem::path tile_root{tile_dir};
+  const std::filesystem::path journal = tile_root / resume_files::kBuiltTiles;
+  std::unordered_set<uint64_t> journaled;
+  if (resume) {
+    if (std::filesystem::exists(tile_root / resume_files::kEnhanceStarted)) {
+      throw std::runtime_error("VALHALLA_RESUME_TILES: enhance has already rewritten the tiles in " +
+                               tile_dir + "; rebuild them from an empty tile directory");
+    }
+    remove_stale_temp_tiles(tile_dir);
+    journaled = read_tile_journal(journal);
+  } else {
+    std::filesystem::remove(journal);
+    std::filesystem::remove(tile_root / resume_files::kEnhanceStarted);
+    std::filesystem::remove(tile_root / resume_files::kEnhancedTiles);
+  }
+  std::queue<std::pair<GraphId, size_t>> tile_queue;
+  std::mutex tile_lock;
+  size_t verified = 0;
+  size_t failed_verification = 0;
+  for (auto id : tiles) {
+    const GraphId base = id.first.tile_base();
+    if (journaled.count(base.value) != 0) {
+      const std::filesystem::path built = tile_root / GraphTile::FileSuffix(base);
+      if (GraphTileBuilder::IsComplete(built, base)) {
+        ++verified;
+        continue;
+      }
+      ++failed_verification;
+      LOG_WARN("Journaled tile failed verification, rebuilding it: " + built.string());
+    }
+    tile_queue.emplace(id);
+  }
+  if (resume) {
+    LOG_INFO("Resuming: " + std::to_string(verified) + " tiles verified, " +
+             std::to_string(failed_verification) + " failed verification, " +
+             std::to_string(tile_queue.size()) + " to build");
+  }
+
   auto tz = DateTime::get_tz_db().from_index(DateTime::get_tz_db().to_index("America/New_York"));
   uint32_t tile_creation_date =
       DateTime::days_from_pivot_date(DateTime::get_formatted_date(DateTime::iso_date_time(tz)));
@@ -1464,12 +1514,6 @@ void BuildLocalTiles(const unsigned int thread_count,
   // Hold the results (DataQuality/stats) for the threads
   std::vector<std::promise<DataQuality>> results(threads.size());
 
-  // Divvy up the work
-  std::queue<std::pair<GraphId, size_t>> tile_queue;
-  std::mutex tile_lock;
-  for (auto id : tiles) {
-    tile_queue.emplace(id);
-  }
 
   // Atomically pass around stats info
   for (size_t i = 0; i < threads.size(); ++i) {
@@ -1528,6 +1572,14 @@ std::map<GraphId, size_t> GraphBuilder::BuildEdges(const boost::property_tree::p
                                                    const std::string& nodes_file,
                                                    const std::string& edges_file) {
   SCOPED_TIMER();
+  // New edges invalidate everything a resumed build stage would reuse.
+  const std::filesystem::path tile_root{pt.get<std::string>("mjolnir.tile_dir")};
+  for (const char* stale :
+       {resume_files::kBuiltTiles, resume_files::kEdgeShapesDone, resume_files::kReclassifyLinksDone,
+        resume_files::kReclassifyFerriesDone, resume_files::kEnhanceStarted,
+        resume_files::kEnhancedTiles}) {
+    std::filesystem::remove(tile_root / stale);
+  }
   uint8_t level = TileHierarchy::levels().back().level;
   auto tiling = TileHierarchy::get_tiling(level);
 
@@ -1562,7 +1614,23 @@ void GraphBuilder::Build(const boost::property_tree::ptree& pt,
       std::max(1u, pt.get<uint32_t>("mjolnir.concurrency", std::thread::hardware_concurrency()));
   const bool keep_node_ids = pt.get<bool>("mjolnir.keep_all_osm_node_ids", false) ||
                              pt.get<bool>("mjolnir.keep_osm_node_ids", false);
-  BuildEdgeShapes(way_nodes_file, edge_shapes_file, edge_node_ids_file, keep_node_ids, concurrency);
+  auto tile_dir = pt.get<std::string>("mjolnir.tile_dir");
+  const std::filesystem::path tile_root{tile_dir};
+  const bool resume = std::getenv("VALHALLA_RESUME_TILES") != nullptr;
+  // On resume, a step whose marker exists finished on an earlier run.
+  const auto finished = [&](const char* marker) {
+    if (resume && std::filesystem::exists(tile_root / marker)) {
+      LOG_INFO("VALHALLA_RESUME_TILES: " + std::string(marker) + " found, skipping that step");
+      return true;
+    }
+    return false;
+  };
+
+  if (!finished(resume_files::kEdgeShapesDone)) {
+    BuildEdgeShapes(way_nodes_file, edge_shapes_file, edge_node_ids_file, keep_node_ids,
+                    concurrency);
+    write_marker(tile_root / resume_files::kEdgeShapesDone);
+  }
 
   // Reclassify links (ramps). Cannot do this when building tiles since the
   // edge list needs to be modified. ReclassifyLinks also infers turn channels
@@ -1571,8 +1639,11 @@ void GraphBuilder::Build(const boost::property_tree::ptree& pt,
   bool reclassify_links = pt.get<bool>("mjolnir.reclassify_links", true);
   bool infer_turn_channels = pt.get<bool>("mjolnir.data_processing.infer_turn_channels", true);
   if (reclassify_links || infer_turn_channels) {
-    ReclassifyLinks(ways_file, nodes_file, edges_file, edge_shapes_file, osmdata, reclassify_links,
-                    infer_turn_channels);
+    if (!finished(resume_files::kReclassifyLinksDone)) {
+      ReclassifyLinks(ways_file, nodes_file, edges_file, edge_shapes_file, osmdata,
+                      reclassify_links, infer_turn_channels);
+      write_marker(tile_root / resume_files::kReclassifyLinksDone);
+    }
   } else {
     LOG_WARN("Not reclassifying link graph edges or inferring turn channels");
   }
@@ -1580,7 +1651,10 @@ void GraphBuilder::Build(const boost::property_tree::ptree& pt,
   // Do not reclassify ferry connection edges if no hierarchies are built. If reclassifying,
   // we use RoadClass::kPrimary (highway classification) as cutoff.
   if (pt.get<bool>("mjolnir.hierarchy", true)) {
-    ReclassifyFerryConnections(ways_file, edge_shapes_file, nodes_file, edges_file);
+    if (!finished(resume_files::kReclassifyFerriesDone)) {
+      ReclassifyFerryConnections(ways_file, edge_shapes_file, nodes_file, edges_file);
+      write_marker(tile_root / resume_files::kReclassifyFerriesDone);
+    }
   } else {
     LOG_WARN("Not reclassifying ferry connections since no hierarches are being created");
   }
@@ -1590,8 +1664,6 @@ void GraphBuilder::Build(const boost::property_tree::ptree& pt,
   unsigned int threads =
       std::max(static_cast<unsigned int>(1),
                pt.get<unsigned int>("mjolnir.concurrency", std::thread::hardware_concurrency()));
-
-  auto tile_dir = pt.get<std::string>("mjolnir.tile_dir");
 
   BuildLocalTiles(threads, osmdata, ways_file, way_nodes_file, edge_shapes_file, edge_node_ids_file,
                   nodes_file, edges_file, complex_from_restriction_file, complex_to_restriction_file,

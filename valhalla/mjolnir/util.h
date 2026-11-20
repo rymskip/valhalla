@@ -11,11 +11,13 @@
 
 #include <array>
 #include <atomic>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -369,6 +371,45 @@ bool build_tile_set(const boost::property_tree::ptree& config,
                     const std::vector<std::string>& input_files,
                     const BuildStage start_stage = BuildStage::kInitialize,
                     const BuildStage end_stage = BuildStage::kValidate);
+
+/**
+ * Flush a file or directory to disk. Throws std::system_error when it cannot.
+ */
+void sync_to_disk(const std::filesystem::path& path);
+
+/**
+ * Create an empty marker file, then flush it and its directory to disk.
+ */
+void write_marker(const std::filesystem::path& path);
+
+/**
+ * Record a tile a stage finished in that stage's journal. The tile and its directory entry reach
+ * the disk before its journal line does, so a journaled tile survives a crash.
+ */
+void append_to_tile_journal(const std::filesystem::path& tile_dir,
+                            const char* journal_name,
+                            const baldr::GraphId& tile_id);
+
+/**
+ * The tile ids a journal names. A torn last line is skipped, so its tile counts as unfinished.
+ */
+std::unordered_set<uint64_t> read_tile_journal(const std::filesystem::path& journal);
+
+/**
+ * Remove the temp tiles an interrupted run left in the tile directory.
+ */
+void remove_stale_temp_tiles(const std::filesystem::path& tile_dir);
+
+// Files in the tile directory that let VALHALLA_RESUME_TILES pick up an interrupted stage.
+namespace resume_files {
+constexpr const char* kBuiltTiles = "built_tiles.journal";
+constexpr const char* kEnhancedTiles = "enhanced_tiles.journal";
+constexpr const char* kEdgeShapesDone = "edge_shapes.done";
+constexpr const char* kReclassifyLinksDone = "reclassify_links.done";
+constexpr const char* kReclassifyFerriesDone = "reclassify_ferries.done";
+constexpr const char* kEnhanceStarted = "enhance.started";
+constexpr const char* kLock = "build.lock";
+} // namespace resume_files
 
 /**
  * Compute the tileset-wide build id from the per-tile data hashes already stored in each tile
